@@ -311,19 +311,167 @@ class GoofishCompassService:
             num *= 10000
         return int(num)
 
+    @classmethod
+    def _extract_detail_header_metrics(cls, stat_blocks: Iterable[str]) -> dict[str, Any]:
+        """Extract counters only from the current item's detail-header stat block.
+
+        Goofish recommendation cards also contain labels such as ``12人想要``.
+        Those counters describe the recommended item, not the detail item being
+        collected, so callers must pass only the stat block under the detail
+        header (the block that contains the current item's browse counter).
+        """
+        # ``stat_blocks`` are ordered by their on-screen position.  A detail
+        # page can repeat the same labels in adjacent layout containers (and,
+        # further down, in recommendation cards).  Preserve that order and
+        # trust the first metric shown in the current item's visible header;
+        # a set would lose the only reliable ordering information and make a
+        # valid counter look ambiguous.
+        want_values: list[int] = []
+        view_values: list[int] = []
+        # The public item page presents the two counters together in the
+        # current listing's summary row, e.g. ``121人想要 1150浏览``.  Keep
+        # those paired values separate from individual counter nodes: a
+        # recommendation card can contain a single ``X人想要`` node, but it
+        # must never supplement a current item which does not display that
+        # counter itself.
+        summary_pairs: list[tuple[int, int]] = []
+
+        def append_unique(values: list[int], value: int | None) -> None:
+            if value is not None and value not in values:
+                values.append(value)
+
+        for block in stat_blocks:
+            if not isinstance(block, str):
+                continue
+            text = re.sub(r"\s+", " ", block).strip()
+            if not text:
+                continue
+
+            block_wants: list[int] = []
+            for groups in re.findall(
+                r"(\d+(?:\.\d+)?\s*万?)\s*人?想要|"
+                r"想要\s*[:：]?\s*(\d+(?:\.\d+)?\s*万?)",
+                text,
+            ):
+                parsed = cls._parse_cn_number(next((part for part in groups if part), None))
+                if parsed is not None and parsed not in block_wants:
+                    block_wants.append(parsed)
+            # Remove the wanted-count token before looking for a compact
+            # ``number 浏览`` form.  Otherwise text such as ``想要 1万 浏览
+            # 320`` can incorrectly treat the wanted number as the browse
+            # number simply because it is immediately before the next label.
+            view_text = re.sub(
+                r"(?:\d+(?:\.\d+)?\s*万?)\s*人?想要|"
+                r"想要\s*[:：]?\s*(?:\d+(?:\.\d+)?\s*万?)",
+                " ",
+                text,
+            )
+            block_views: list[int] = []
+            view_matches = re.findall(
+                r"(\d+(?:\.\d+)?\s*万?)\s*(?:浏览量|浏览)|"
+                r"(?:浏览量|浏览)\s*[:：]?\s*(\d+(?:\.\d+)?\s*万?)",
+                view_text,
+            )
+            for groups in view_matches:
+                parsed = cls._parse_cn_number(next((part for part in groups if part), None))
+                if parsed is not None and parsed not in block_views:
+                    block_views.append(parsed)
+
+            for value in block_wants:
+                append_unique(want_values, value)
+            for value in block_views:
+                append_unique(view_values, value)
+            if block_wants and block_views:
+                pair = (block_wants[0], block_views[0])
+                if pair not in summary_pairs:
+                    summary_pairs.append(pair)
+
+        # A paired current-detail summary is stronger evidence than individual
+        # metric nodes.  Prefer it even when a shorter sibling node has the
+        # same position in the DOM and sorted before the complete summary.
+        if summary_pairs:
+            want_count, view_count = summary_pairs[0]
+            result: dict[str, Any] = {
+                "want_count": want_count,
+                "view_count": view_count,
+                "metric_sources": {
+                    "want_count": "dom.visible_detail_summary_pair",
+                    "view_count": "dom.visible_detail_summary_pair",
+                },
+            }
+            if len(summary_pairs) > 1:
+                result["metric_capture_status"] = {
+                    "want_count": "additional_visible_metric_pairs_ignored",
+                    "view_count": "additional_visible_metric_pairs_ignored",
+                }
+            return result
+
+        # A missing selector or changed page structure must not be interpreted
+        # as an empty metric.  An explicit absence is reliable only when this
+        # detail stat block exposed at least one of its counters.
+        has_detail_stat_label = bool(want_values or view_values)
+        result: dict[str, Any] = {}
+        metric_sources: dict[str, str] = {}
+        metric_status: dict[str, str] = {}
+
+        for field, values in (("want_count", want_values), ("view_count", view_values)):
+            if values:
+                result[field] = values[0]
+                metric_sources[field] = "dom.visible_detail_header"
+                if len(values) > 1:
+                    metric_status[field] = "additional_visible_metrics_ignored"
+            elif has_detail_stat_label:
+                metric_status[field] = "not_displayed_in_detail_header"
+
+        if metric_sources:
+            result["metric_sources"] = metric_sources
+        if metric_status:
+            result["metric_capture_status"] = metric_status
+        return result
+
     @staticmethod
     def _deep_find_first(obj: Any, keys: set[str]) -> Any:
-        stack: list[Any] = [obj]
+        value, _ = GoofishCompassService._deep_find_first_with_path(obj, keys)
+        return value
+
+    @staticmethod
+    def _deep_find_first_with_path(obj: Any, keys: set[str]) -> tuple[Any, str | None]:
+        """Return the first matching value and its non-sensitive payload path."""
+        stack: list[tuple[Any, str]] = [(obj, "data")]
         while stack:
-            cur = stack.pop()
+            cur, path = stack.pop()
             if isinstance(cur, dict):
                 for k, v in cur.items():
                     if k in keys and v not in (None, "", [], {}):
-                        return v
-                    stack.append(v)
+                        return v, f"{path}.{k}"
+                    stack.append((v, f"{path}.{k}"))
             elif isinstance(cur, list):
-                stack.extend(cur)
-        return None
+                stack.extend((value, f"{path}[{index}]") for index, value in enumerate(cur))
+        return None, None
+
+    @staticmethod
+    def _payload_mentions_item_id(payload: dict[str, Any], item_id: str) -> bool:
+        """Accept a detail payload only when it explicitly identifies the item.
+
+        Detail pages may request recommendation modules alongside the current
+        listing.  Recursive field lookup is safe only after a payload has a
+        recognized ID field matching the target item.
+        """
+        expected = str(item_id or "").strip()
+        if not expected:
+            return True
+        id_keys = {"id", "itemId", "item_id", "itemid", "auctionId", "auction_id"}
+        stack: list[Any] = [payload]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                for key, value in current.items():
+                    if key in id_keys and str(value or "").strip() == expected:
+                        return True
+                    stack.append(value)
+            elif isinstance(current, list):
+                stack.extend(current)
+        return False
 
     @staticmethod
     def _normalize_price_text(value: Any) -> str | None:
@@ -357,9 +505,87 @@ class GoofishCompassService:
         return None
 
     @classmethod
-    def _extract_detail_from_payloads(cls, payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    def _normalize_detail_price(cls, value: Any) -> str | None:
+        """Normalize detail API amounts to yuan.
+
+        The MTOP detail response has variants that return the amount as an
+        integer number of fen (for example ``9900`` for ¥99).  Text values
+        already carrying ``¥``/``￥`` are presentation values and must not be
+        divided again.
+        """
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            amount = float(value)
+            if amount.is_integer() and amount >= 100:
+                amount /= 100
+            return cls._normalize_price_text(round(amount, 2))
+        if isinstance(value, str):
+            text = re.sub(r"\s+", "", value)
+            if not text:
+                return None
+            if text.startswith(("¥", "￥")):
+                return cls._normalize_price_text(text)
+            if re.fullmatch(r"\d+(?:\.\d+)?", text):
+                amount = float(text)
+                if amount.is_integer() and amount >= 100:
+                    amount /= 100
+                return cls._normalize_price_text(amount)
+            return cls._normalize_price_text(text)
+        if isinstance(value, list):
+            parts: list[str] = []
+            for part in value:
+                if isinstance(part, dict) and "text" in part:
+                    parts.append(str(part.get("text") or ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+            if parts:
+                return cls._normalize_detail_price("".join(parts))
+            for part in value:
+                normalized = cls._normalize_detail_price(part)
+                if normalized:
+                    return normalized
+            return None
+        if isinstance(value, dict):
+            for key in ("text", "priceText", "price_text", "value", "amount", "price", "currentPrice"):
+                if key in value and value.get(key) not in (None, "", [], {}):
+                    normalized = cls._normalize_detail_price(value.get(key))
+                    if normalized:
+                        return normalized
+        return None
+
+    @staticmethod
+    def _price_number(value: Any) -> float | None:
+        """Extract the displayed listing's starting unit price."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return round(float(value), 2)
+        match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", str(value).replace(",", ""))
+        if not match:
+            return None
+        try:
+            return round(float(match.group(1)), 2)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _extract_detail_from_payloads(
+        cls,
+        payloads: list[dict[str, Any]],
+        *,
+        expected_item_id: str | None = None,
+    ) -> dict[str, Any]:
         if not payloads:
             return {}
+
+        if expected_item_id:
+            payloads = [
+                payload for payload in payloads
+                if cls._payload_mentions_item_id(payload, expected_item_id)
+            ]
+            if not payloads:
+                return {}
 
         # pick the "best" payload: prefer having nested data
         best = payloads[-1]
@@ -408,7 +634,7 @@ class GoofishCompassService:
             },
         )
 
-        view_value = cls._deep_find_first(
+        view_value, view_source = cls._deep_find_first_with_path(
             data,
             {
                 "viewCount",
@@ -421,14 +647,14 @@ class GoofishCompassService:
                 "readCount",
             },
         )
-        want_value = cls._deep_find_first(
+        want_value, want_source = cls._deep_find_first_with_path(
             data,
             {"wantCount", "want_count", "wantNum", "want_num", "likeCount", "like_count"},
         )
 
         view_count = cls._parse_cn_number(view_value)
         want_count = cls._parse_cn_number(want_value)
-        price_text = cls._normalize_price_text(price_value)
+        price_text = cls._normalize_detail_price(price_value)
 
         result: dict[str, Any] = {}
         if isinstance(description, str):
@@ -437,10 +663,21 @@ class GoofishCompassService:
                 result["description"] = desc_clean
         if price_text:
             result["price"] = price_text
+            result["unit_price"] = cls._price_number(price_text)
         if view_count is not None:
             result["view_count"] = view_count
         if want_count is not None:
             result["want_count"] = want_count
+        metric_sources = {
+            key: value
+            for key, value in {
+                "view_count": view_source if view_count is not None else None,
+                "want_count": want_source if want_count is not None else None,
+            }.items()
+            if value
+        }
+        if metric_sources:
+            result["metric_sources"] = metric_sources
         return result
 
     async def _extract_detail_from_dom(self, page: Any) -> dict[str, Any]:
@@ -484,6 +721,7 @@ class GoofishCompassService:
                         price_text = self._normalize_price_text(price)
                         if price_text:
                             result.setdefault("price", price_text)
+                            result.setdefault("unit_price", self._price_number(price_text))
         except Exception:
             pass
 
@@ -497,7 +735,50 @@ class GoofishCompassService:
         except Exception:
             pass
 
-        # 3) Body text regex
+        # 3) Current-detail metric header.  Dynamic Goofish CSS class suffixes
+        # have changed more than once, so do not rely on a single ``want--*``
+        # selector.  We only inspect visible metric text in the first detail
+        # viewport, which is above recommendation cards and therefore remains
+        # tied to the item currently being viewed.
+        try:
+            stat_blocks: list[str] = []
+            visible_metric_blocks = await page.locator("body").evaluate(
+                """body => {
+                    const metric = /(?:\\d+(?:\\.\\d+)?\\s*万?\\s*(?:人?想要|浏览量|浏览)|(?:想要|浏览量|浏览)\\s*[:：]?\\s*\\d+(?:\\.\\d+)?\\s*万?)/;
+                    const viewportBottom = window.innerHeight || 720;
+                    const blocks = [];
+                    for (const element of body.querySelectorAll('*')) {
+                        const text = (element.innerText || '').replace(/\\s+/g, ' ').trim();
+                        if (!text || text.length > 240 || !metric.test(text)) continue;
+                        if (/为你推荐|猜你喜欢/.test(text)) continue;
+                        const rect = element.getBoundingClientRect();
+                        if (rect.width <= 0 || rect.height <= 0 || rect.bottom <= 0 || rect.top >= viewportBottom) continue;
+                        blocks.push({ text, top: rect.top });
+                    }
+                    blocks.sort((a, b) => a.top - b.top || a.text.length - b.text.length);
+                    return [...new Set(blocks.map(item => item.text))].slice(0, 12);
+                }"""
+            )
+            if isinstance(visible_metric_blocks, list):
+                stat_blocks.extend(
+                    block for block in visible_metric_blocks if isinstance(block, str)
+                )
+
+            header_metrics = self._extract_detail_header_metrics(stat_blocks)
+            for field in ("want_count", "view_count"):
+                if field in header_metrics:
+                    result[field] = header_metrics[field]
+            if header_metrics.get("metric_sources"):
+                result.setdefault("metric_sources", {}).update(header_metrics["metric_sources"])
+            if header_metrics.get("metric_capture_status"):
+                result.setdefault("metric_capture_status", {}).update(
+                    header_metrics["metric_capture_status"]
+                )
+        except Exception:
+            pass
+
+        # 4) Body text may still provide an unstructured title or price, but
+        # never engagement metrics because it includes recommendation cards.
         try:
             body_text = await page.locator("body").inner_text()
             if isinstance(body_text, str) and body_text:
@@ -512,22 +793,8 @@ class GoofishCompassService:
                         price_text = self._normalize_price_text(m.group(1))
                         if price_text:
                             result["price"] = price_text
+                            result["unit_price"] = self._price_number(price_text)
 
-                if "want_count" not in result:
-                    m = re.search(r"(\d+(?:\.\d+)?\s*万?)\s*人想要", body_text)
-                    if m:
-                        want = self._parse_cn_number(m.group(0))
-                        if want is not None:
-                            result["want_count"] = want
-
-                if "view_count" not in result:
-                    m = re.search(r"(?:浏览量|浏览)[:：]?\s*(\d+(?:\.\d+)?\s*万?)", body_text)
-                    if not m:
-                        m = re.search(r"(\d+(?:\.\d+)?\s*万?)\s*(?:浏览量|浏览)", body_text)
-                    if m:
-                        view = self._parse_cn_number(m.group(0))
-                        if view is not None:
-                            result["view_count"] = view
         except Exception:
             pass
 
@@ -606,24 +873,75 @@ class GoofishCompassService:
             await collect_detail_responses(timeout_ms=int(self.config.detail_response_timeout_ms))
             await asyncio.sleep(0.5)
 
-            detail = self._extract_detail_from_payloads(detail_payloads)
+            detail = self._extract_detail_from_payloads(
+                detail_payloads,
+                expected_item_id=str(item.get("item_id") or "") or None,
+            )
+            # The current detail header is authoritative for engagement
+            # counters.  Read it even when a detail payload included a generic
+            # count field, because some payload fields belong to another
+            # product/card or use a different metric definition.
+            # The summary row is rendered asynchronously on some item pages.
+            # Retry the DOM-only read briefly; this does not issue additional
+            # platform requests, and avoids persisting an otherwise available
+            # counter as missing merely because its first paint was late.
             dom_detail: dict[str, Any] = {}
-            if (
-                not detail
-                or detail.get("description") in (None, "")
-                or detail.get("price") in (None, "")
-                or detail.get("view_count") is None
-                or detail.get("want_count") is None
-            ):
-                dom_detail = await self._extract_detail_from_dom(page)
+
+            def capture_score(value: dict[str, Any]) -> int:
+                status = value.get("metric_capture_status") or {}
+                return sum(
+                    metric in value
+                    or status.get(metric) == "not_displayed_in_detail_header"
+                    for metric in ("want_count", "view_count")
+                )
+
+            for attempt in range(3):
+                candidate = await self._extract_detail_from_dom(page)
+                if candidate and (
+                    not dom_detail or capture_score(candidate) >= capture_score(dom_detail)
+                ):
+                    dom_detail = candidate
+                captured_metrics = {
+                    metric
+                    for metric in ("want_count", "view_count")
+                    if metric in dom_detail
+                    or (dom_detail.get("metric_capture_status") or {}).get(metric)
+                    == "not_displayed_in_detail_header"
+                }
+                if captured_metrics == {"want_count", "view_count"}:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.75)
 
             if dom_detail:
                 merged = dict(detail or {})
+                dom_sources = dom_detail.get("metric_sources") or {}
+                dom_status = dom_detail.get("metric_capture_status") or {}
+
+                for metric in ("want_count", "view_count"):
+                    if metric in dom_detail:
+                        # Header counters are tied to the current detail item.
+                        merged[metric] = dom_detail[metric]
+                    elif dom_status.get(metric) == "not_displayed_in_detail_header":
+                        # The header is present but this item has no such
+                        # counter; do not retain a recommendation/payload value.
+                        merged[metric] = None
+
                 for k, v in dom_detail.items():
+                    if k in {"want_count", "view_count", "metric_sources", "metric_capture_status"}:
+                        continue
                     if v in (None, "", [], {}):
                         continue
                     if merged.get(k) in (None, "", 0, [], {}):
                         merged[k] = v
+
+                if dom_sources:
+                    merged.setdefault("metric_sources", {}).update(dom_sources)
+                if dom_status:
+                    merged.setdefault("metric_capture_status", {}).update(dom_status)
+                    for metric, status in dom_status.items():
+                        if status == "not_displayed_in_detail_header":
+                            merged.get("metric_sources", {}).pop(metric, None)
                 detail = merged
 
             if detail:
@@ -644,6 +962,46 @@ class GoofishCompassService:
                 await page.close()
             except Exception:
                 pass
+
+    async def fetch_item_detail(self, *, item_id: str) -> dict[str, Any]:
+        """Collect one public item detail through the mapped account session.
+
+        This is intentionally separate from keyword search so an operator can
+        re-check an already collected listing without relying on ranking or
+        search-result parsing.  It is read-only: no chat, listing, or account
+        mutation is performed here.
+        """
+        normalized_item_id = str(item_id or "").strip()
+        if not re.fullmatch(r"\d{6,32}", normalized_item_id):
+            return {"item": None, "error": "invalid_item_id"}
+        if not PLAYWRIGHT_AVAILABLE:
+            return {"item": None, "error": "Playwright 不可用"}
+
+        try:
+            await self.browser.init_browser(headless=self.config.headless)
+            await self.browser.navigate_to("https://www.goofish.com", timeout=self.config.navigation_timeout_ms)
+            await self.browser.set_cookies(self.cookie_value)
+            if self.browser.page:
+                await self.browser.page.reload()
+            await self.browser.wait_for_network_idle(timeout=self.config.network_idle_timeout_ms)
+
+            detail = await self._fetch_single_detail({"item_id": normalized_item_id})
+            if not detail or detail.get("detail_error"):
+                return {"item": None, "error": str((detail or {}).get("detail_error") or "detail_not_found")}
+            return {
+                "item": {
+                    "item_id": normalized_item_id,
+                    "item_url": self._canonical_item_url(normalized_item_id),
+                    **detail,
+                },
+                "is_real_data": True,
+                "source": "playwright_detail",
+            }
+        except Exception as exc:
+            logger.exception("Goofish item detail probe failed")
+            return {"item": None, "error": type(exc).__name__}
+        finally:
+            await self.browser.close_browser()
 
     async def search(
         self,
@@ -758,6 +1116,8 @@ class GoofishCompassService:
                         if detail.get("want_count") is not None:
                             item["want_count"] = detail["want_count"]
                         item.update(detail)
+                    if item.get("unit_price") is None:
+                        item["unit_price"] = self._price_number(item.get("price"))
 
             return {
                 "items": items,
